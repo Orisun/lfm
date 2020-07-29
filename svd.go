@@ -1,6 +1,6 @@
 // Date         : 2020-07-27 13:16
 // Author       : zhangzhaoyang
-// Description  : 参考 https://www.cnblogs.com/zhangchaoyang/articles/5517186.html
+// Description  : 参考[基于矩阵分解的推荐算法](https://www.cnblogs.com/zhangchaoyang/articles/5517186.html)
 
 package lfm
 
@@ -233,7 +233,9 @@ func (self *SVD) vecDot(a, b []float32, l int) float32 {
 func (self *SVD) Train() {
 	for iter := 0; iter < self.epochs; iter++ {
 		self.train()
-		self.learningRate *= 0.9 //每轮迭代后，学习率要衰减
+		if self.learningRate > 1E-5 {
+			self.learningRate *= 0.9 //每轮迭代后，学习率要衰减
+		}
 		glog.Infof("iteration %d train finish, learning rate is %f, mse is %f", iter, self.learningRate, self.getError())
 	}
 	glog.Infof("train over")
@@ -363,9 +365,6 @@ func (self *SVD) update(rating *Rating) {
 		for f := 0; f < self.F; f++ {
 			deltaP := err*self.Q[itemIndex][f] - self.lambda*self.P[userIndex][f]
 			self.P[userIndex][f] += self.learningRate * deltaP
-		}
-		//把P向量更新完再去更新Q向量
-		for f := 0; f < self.F; f++ {
 			deltaQ := err*self.P[userIndex][f] - self.lambda*self.Q[itemIndex][f]
 			self.Q[itemIndex][f] += self.learningRate * deltaQ
 		}
@@ -446,4 +445,3 @@ func AtomicAddFloat32(val *float32, delta float32) (new float32) {
 	}
 	return
 }
-
