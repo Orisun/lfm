@@ -208,7 +208,7 @@ func (self *SVD) Predict(uid, itemid int64) (score float32, userIndex, itemIndex
 		if itemIndex, ok = self.ItemIdIndex[itemid]; ok {
 			dot := self.vecDot(self.P[userIndex], self.Q[itemIndex], self.F)
 			score = dot + self.Mu + self.Bu[userIndex] + self.Bi[itemIndex]
-			if math.IsNaN(float64(score)) {
+			if math.IsNaN(float64(score)) { //如果出现NaN，很可能是因为你的学习率设大了，调小一些
 				glog.Errorf("score %f dot %f Mu %f Bu %f Bi %f", score, dot, self.Mu, self.Bu[userIndex], self.Bi[itemIndex])
 				syscall.Exit(1)
 			}
@@ -358,6 +358,10 @@ func (self *SVD) update(rating *Rating) {
 	uid := rating.Uid
 	itemid := rating.ItemId
 	rate := rating.Rate
+	if rate < 1E-3 || rate > 10 || math.IsNaN(float64(rate)) {
+		glog.Errorf("invalid rate %f", rate) //如果训练样本里有脏数据，可能会导致计算过程中出现NaN
+		return
+	}
 	rate_hat, userIndex, itemIndex := self.Predict(uid, itemid)
 	if userIndex >= 0 && itemIndex >= 0 {
 		err := rate - rate_hat
