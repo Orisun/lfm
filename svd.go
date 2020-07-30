@@ -10,18 +10,19 @@ import (
 	"flag"
 	"fmt"
 	"github.com/golang/glog"
-	"github.com/ziutek/blas"
+	"gonum.org/v1/gonum/integrate"
+	"gonum.org/v1/gonum/stat"
 	"io"
 	"math"
 	"math/rand"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unsafe"
 )
 
 var (
@@ -56,6 +57,7 @@ type SVD struct {
 	lambda       float32 //正则项系数
 	epochs       int
 	trainFiles   []string
+	validFiles   []string
 
 	//记录训练误差
 	error  float32
@@ -72,17 +74,20 @@ func (self *SVD) addError(err float32) {
 	atomic.AddUint32(&self.sample, 1)
 }
 
-func (self *SVD) getError() float32 {
-	return self.error / float32(self.sample)
+func (self *SVD) getError() (count int, loss float32) {
+	count = int(self.sample)
+	loss = self.error / float32(self.sample)
+	return
 }
 
-//InitParam 如果要对rate执行时间衰减，则trainFile的文件名必须以yyyymmdd结尾。trainFile里每行的格式uid itemid:rate itemid:rate ......
-func (self *SVD) InitParam(F int, LearningRate, Lambda float32, Epochs int, trainFiles []string) {
+//InitParam 如果要对rate执行时间衰减，则trainFile/validFile的文件名必须以yyyymmdd结尾。trainFile里每行的格式uid itemid:rate itemid:rate ......
+func (self *SVD) InitParam(F int, LearningRate, Lambda float32, Epochs int, trainFiles, validFiles []string) {
 	self.F = F
 	self.learningRate = LearningRate
 	self.lambda = Lambda
 	self.epochs = Epochs
 	self.trainFiles = trainFiles
+	self.validFiles = validFiles
 	self.statisticCorpus()
 	UserCount := len(self.UidIndex)
 	ItemCount := len(self.ItemIdIndex)
@@ -116,169 +121,7 @@ func (self *SVD) timeDecay(ago time.Time) float64 {
 	return math.Exp(-*decay * interval)
 }
 
-func (self *SVD) statisticCorpus() error {
-	var rateSum float32
-	var rateCount int32
-	uidMap := make(map[int64]bool)
-	itemIdMap := make(map[int64]bool)
-
-	for _, infile := range self.trainFiles {
-		decayCoef := 1.0
-		if *decay > 0 {
-			timeloc, _ := time.LoadLocation("Asia/Shanghai")
-			if len(infile) > 8 {
-				postfix := infile[len(infile)-8:]
-				if day, err := time.ParseInLocation("20060102", postfix, timeloc); err != nil {
-					return err
-				} else {
-					decayCoef = self.timeDecay(day)
-				}
-			} else {
-				return fmt.Errorf("train file name must end with date if you need time decay for rate")
-			}
-		}
-
-		file, err := os.OpenFile(infile, os.O_RDONLY, os.ModePerm)
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-		reader := bufio.NewReader(file)
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				if err != io.EOF {
-					return err
-				} else {
-					break
-				}
-			}
-			arr := strings.Split(strings.Trim(line, "\n"), " ")
-			if len(arr) >= 2 {
-				if uid, err := strconv.ParseInt(arr[0], 10, 64); err != nil {
-					glog.Errorf("parse uid failed: %s", arr[0])
-					continue
-				} else {
-					uidMap[uid] = true
-					for _, ele := range arr[1:] {
-						brr := strings.Split(ele, ":")
-						if len(brr) == 2 {
-							if itemid, err := strconv.ParseInt(brr[0], 10, 64); err != nil {
-								glog.Errorf("parse itemid failed: %s", ele)
-								continue
-							} else {
-								itemIdMap[itemid] = true
-								if rate, err := strconv.ParseFloat(brr[1], 64); err != nil {
-									glog.Errorf("parse rate failed: %s", brr[1])
-									continue
-								} else {
-									rateSum += float32(rate * decayCoef)
-									rateCount++
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	self.Mu = rateSum / float32(rateCount)
-	glog.Infof("total %d rate, average is %f", rateCount, self.Mu)
-	self.UidIndex = make(map[int64]int)
-	index := 0
-	for uid, _ := range uidMap {
-		self.UidIndex[uid] = index
-		index++
-	}
-	self.ItemIdIndex = make(map[int64]int)
-	index = 0
-	for itemid, _ := range itemIdMap {
-		self.ItemIdIndex[itemid] = index
-		index++
-	}
-	return nil
-}
-
-func (self *SVD) Predict(uid, itemid int64) (score float32, userIndex, itemIndex int) {
-	userIndex = -1
-	itemIndex = -1
-	var ok bool
-	if userIndex, ok = self.UidIndex[uid]; ok {
-		if itemIndex, ok = self.ItemIdIndex[itemid]; ok {
-			dot := self.vecDot(self.P[userIndex], self.Q[itemIndex], self.F)
-			score = dot + self.Mu + self.Bu[userIndex] + self.Bi[itemIndex]
-			if math.IsNaN(float64(score)) { //如果出现NaN，很可能是因为你的学习率设大了，调小一些
-				glog.Errorf("score %f dot %f Mu %f Bu %f Bi %f", score, dot, self.Mu, self.Bu[userIndex], self.Bi[itemIndex])
-				syscall.Exit(1)
-			}
-		} else {
-			glog.Errorf("could not found index of itemid %d", itemid)
-		}
-	} else {
-		glog.Errorf("could not found index of uid %d", uid)
-	}
-	return
-}
-
-func (self *SVD) vecDot(a, b []float32, l int) float32 {
-	//var sum float32 = 0.0
-	//for i := 0; i < l; i++ {
-	//	sum += a[i] * b[i]
-	//}
-	//return sum
-	return blas.Sdot(l, a, 1, b, 1) //长度超过16时，用汇编计算向量内积会快一些
-}
-
-func (self *SVD) Train() {
-	for iter := 0; iter < self.epochs; iter++ {
-		self.train()
-		if self.learningRate > 1E-5 {
-			self.learningRate *= 0.9 //每轮迭代后，学习率要衰减
-		}
-		glog.Infof("iteration %d train finish, learning rate is %f, mse is %f", iter, self.learningRate, self.getError())
-	}
-	glog.Infof("train over")
-}
-
-func (self *SVD) train() {
-	corpus = make(chan *Rating, 10000)
-	stopSignal := make(chan bool, *parallel)
-	wg := sync.WaitGroup{}
-	wg.Add(*parallel)
-	for i := 0; i < *parallel; i++ {
-		go func() {
-			defer wg.Done()
-		LOOP:
-			for {
-				select {
-				case <-stopSignal:
-					break LOOP //注意：只写一个break不会跳出for循环！！！
-				case rating := <-corpus:
-					self.update(rating)
-				}
-			}
-		}()
-	}
-
-	self.trainFiles = ShuffleStringList(self.trainFiles) //对训练文件进行shuffle
-	for _, trainFile := range self.trainFiles {
-		if err := self.parseTrainFile(trainFile, corpus); err != nil {
-			glog.Errorf("read train file %s failed %v", trainFile, err)
-		}
-		glog.Infof("read train file %s finish", trainFile)
-	}
-	for i := 0; i < *parallel; i++ {
-		stopSignal <- true
-	}
-	wg.Wait()
-	close(corpus)
-	for rating := range corpus {
-		self.update(rating)
-	}
-}
-
-func (self *SVD) parseTrainFile(infile string, channel chan *Rating) error {
+func (self *SVD) parseFile(infile string, channel chan *Rating) error {
 	decayCoef := 1.0
 	if *decay > 0 {
 		if len(infile) > 8 {
@@ -354,14 +197,126 @@ func (self *SVD) parseTrainFile(infile string, channel chan *Rating) error {
 	return nil
 }
 
+//statisticCorpus 先统计一次训练样本，给Mu、UidIndex、ItemIdIndex赋值
+func (self *SVD) statisticCorpus() error {
+	var rateSum float32
+	var rateCount int32
+	uidMap := make(map[int64]bool)
+	itemIdMap := make(map[int64]bool)
+
+	corpus = make(chan *Rating, 10000)
+	stopSignal := make(chan bool, 1)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+	LOOP:
+		for {
+			select {
+			case <-stopSignal:
+				break LOOP //注意：只写一个break不会跳出for循环！！！
+			case rating := <-corpus:
+				uidMap[rating.Uid] = true
+				itemIdMap[rating.ItemId] = true
+				rateSum += rating.Rate
+				rateCount++
+			}
+		}
+	}()
+	for _, infile := range self.trainFiles {
+		self.parseFile(infile, corpus)
+	}
+	stopSignal <- true
+	wg.Wait()
+
+	self.Mu = rateSum / float32(rateCount)
+	glog.Infof("total %d rate, average is %f", rateCount, self.Mu)
+	self.UidIndex = make(map[int64]int)
+	index := 0
+	for uid, _ := range uidMap {
+		self.UidIndex[uid] = index
+		index++
+	}
+	self.ItemIdIndex = make(map[int64]int)
+	index = 0
+	for itemid, _ := range itemIdMap {
+		self.ItemIdIndex[itemid] = index
+		index++
+	}
+	return nil
+}
+
+func (self *SVD) Predict(uid, itemid int64) (score float32, userIndex, itemIndex int) {
+	userIndex = -1
+	itemIndex = -1
+	var ok bool
+	if userIndex, ok = self.UidIndex[uid]; ok {
+		if itemIndex, ok = self.ItemIdIndex[itemid]; ok {
+			dot := VecDot(self.P[userIndex], self.Q[itemIndex], self.F)
+			score = dot + self.Mu + self.Bu[userIndex] + self.Bi[itemIndex]
+			if math.IsNaN(float64(score)) { //如果出现NaN，很可能是因为你的学习率设大了，调小一些
+				glog.Errorf("score %f dot %f Mu %f Bu %f Bi %f", score, dot, self.Mu, self.Bu[userIndex], self.Bi[itemIndex])
+				syscall.Exit(1)
+			}
+		}
+	}
+	return
+}
+
+func (self *SVD) Train() {
+	for iter := 0; iter < self.epochs; iter++ {
+		self.train()
+		testCount, auc := self.metric()
+		trainCount, trainLoss := self.getError()
+		glog.Infof("iteration %d train finish, learning rate=%f, train record count %d, train mse=%f, test record count %d, test auc=%f", iter, self.learningRate, trainCount, trainLoss, testCount, auc)
+		if self.learningRate > 1E-5 {
+			self.learningRate *= 0.9 //每轮迭代后，学习率要衰减
+		}
+	}
+	glog.Infof("train over")
+}
+
+func (self *SVD) train() {
+	corpus = make(chan *Rating, 10000)
+	stopSignal := make(chan bool, *parallel)
+	wg := sync.WaitGroup{}
+	wg.Add(*parallel)
+	for i := 0; i < *parallel; i++ {
+		go func() {
+			defer wg.Done()
+		LOOP:
+			for {
+				select {
+				case <-stopSignal:
+					break LOOP //注意：只写一个break不会跳出for循环！！！
+				case rating := <-corpus:
+					self.update(rating)
+				}
+			}
+		}()
+	}
+
+	self.trainFiles = ShuffleStringList(self.trainFiles) //对训练文件进行shuffle
+	for _, trainFile := range self.trainFiles {
+		if err := self.parseFile(trainFile, corpus); err != nil {
+			glog.Errorf("read train file %s failed %v", trainFile, err)
+		}
+		glog.Infof("read train file %s finish", trainFile)
+	}
+	for i := 0; i < *parallel; i++ {
+		stopSignal <- true
+	}
+	wg.Wait()
+	close(corpus)
+	for rating := range corpus {
+		self.update(rating)
+	}
+}
+
 func (self *SVD) update(rating *Rating) {
 	uid := rating.Uid
 	itemid := rating.ItemId
 	rate := rating.Rate
-	if rate < 1E-3 || rate > 10 || math.IsNaN(float64(rate)) {
-		glog.Errorf("invalid rate %f", rate) //如果训练样本里有脏数据，可能会导致计算过程中出现NaN
-		return
-	}
 	rate_hat, userIndex, itemIndex := self.Predict(uid, itemid)
 	if userIndex >= 0 && itemIndex >= 0 {
 		err := rate - rate_hat
@@ -377,6 +332,69 @@ func (self *SVD) update(rating *Rating) {
 		deltaBi := err - self.lambda*self.Bi[itemIndex]
 		self.Bi[itemIndex] += self.learningRate * deltaBi
 	}
+}
+
+type Result struct {
+	y_hat  float64
+	y_true bool
+	weight float64
+}
+
+func (self *SVD) metric() (count int, auc float64) {
+	results := []*Result{}
+	corpus = make(chan *Rating, 10000)
+	stopSignal := make(chan bool, 1)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+	LOOP:
+		for {
+			select {
+			case <-stopSignal:
+				break LOOP //注意：只写一个break不会跳出for循环！！！
+			case rating := <-corpus:
+				score, userIndex, itemIndex := self.Predict(rating.Uid, rating.ItemId)
+				if userIndex >= 0 && itemIndex >= 0 { //如果uid和itemid没有出现过，则不会进入验证集
+					label := false
+					weight := float64(rating.Rate)
+					if rating.Rate > 0 {
+						label = true
+					} else {
+						weight = 1.0
+					}
+					results = append(results, &Result{
+						y_hat:  float64(score),
+						y_true: label,
+						weight: weight,
+					})
+				}
+
+			}
+		}
+	}()
+	for _, infile := range self.validFiles {
+		self.parseFile(infile, corpus)
+	}
+	stopSignal <- true
+	wg.Wait()
+
+	count = len(results)
+	//按y_hat从小到大排序
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].y_hat < results[j].y_hat
+	})
+	y_hat := make([]float64, len(results))
+	y_true := make([]bool, len(results))
+	weights := make([]float64, len(results))
+	for i, ele := range results {
+		y_hat[i] = ele.y_hat
+		y_true[i] = ele.y_true
+		weights[i] = ele.weight
+	}
+	tpr, fpr, _ := stat.ROC(nil, y_hat, y_true, weights)
+	auc = integrate.Trapezoidal(fpr, tpr)
+	return
 }
 
 func (self *SVD) SaveModel(modelFile string) {
@@ -409,43 +427,4 @@ func LoadSVDModel(modelFile string) (*SVD, error) {
 			return &model, nil
 		}
 	}
-}
-
-func Shuffle(arr []*Rating) []*Rating {
-	if arr == nil || len(arr) == 0 {
-		return nil
-	}
-	rect := make([]*Rating, len(arr))
-	r := rand.New(rand.NewSource(time.Now().Unix()))
-	for i, j := range r.Perm(len(arr)) {
-		rect[i] = arr[j]
-	}
-	return rect
-}
-
-func ShuffleStringList(arr []string) []string {
-	if arr == nil || len(arr) == 0 {
-		return nil
-	}
-	rect := make([]string, len(arr))
-	r := rand.New(rand.NewSource(time.Now().Unix()))
-	for i, j := range r.Perm(len(arr)) {
-		rect[i] = arr[j]
-	}
-	return rect
-}
-
-func AtomicAddFloat32(val *float32, delta float32) (new float32) {
-	for {
-		old := *val
-		new = old + delta
-		if atomic.CompareAndSwapUint32(
-			(*uint32)(unsafe.Pointer(val)),
-			math.Float32bits(old),
-			math.Float32bits(new),
-		) {
-			break
-		}
-	}
-	return
 }
