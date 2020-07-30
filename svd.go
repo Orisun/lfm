@@ -266,9 +266,10 @@ func (self *SVD) Predict(uid, itemid int64) (score float32, userIndex, itemIndex
 func (self *SVD) Train() {
 	for iter := 0; iter < self.epochs; iter++ {
 		self.train()
-		testCount, auc := self.metric()
+		testCount, auc, testLoss := self.metric()
 		trainCount, trainLoss := self.getError()
-		glog.Infof("iteration %d train finish, learning rate=%f, train record count %d, train mse=%f, test record count %d, test auc=%f", iter, self.learningRate, trainCount, trainLoss, testCount, auc)
+		glog.Infof("iteration %d train finish, learning rate=%f, train record count %d, train mse=%f, test record"+
+			" count %d, test auc=%f, test mse=%f", iter, self.learningRate, trainCount, trainLoss, testCount, auc, testLoss)
 		if self.learningRate > 1E-5 {
 			self.learningRate *= 0.9 //每轮迭代后，学习率要衰减
 		}
@@ -340,7 +341,7 @@ type Result struct {
 	weight float64
 }
 
-func (self *SVD) metric() (count int, auc float64) {
+func (self *SVD) metric() (count int, auc, loss float64) {
 	results := []*Result{}
 	corpus = make(chan *Rating, 10000)
 	stopSignal := make(chan bool, 1)
@@ -356,6 +357,8 @@ func (self *SVD) metric() (count int, auc float64) {
 			case rating := <-corpus:
 				score, userIndex, itemIndex := self.Predict(rating.Uid, rating.ItemId)
 				if userIndex >= 0 && itemIndex >= 0 { //如果uid和itemid没有出现过，则不会进入验证集
+					err := float64(rating.Rate - score)
+					loss += err * err
 					label := false
 					weight := float64(rating.Rate)
 					if rating.Rate > 0 {
@@ -380,6 +383,7 @@ func (self *SVD) metric() (count int, auc float64) {
 	wg.Wait()
 
 	count = len(results)
+	loss /= float64(count) //均方误差
 	//按y_hat从小到大排序
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].y_hat < results[j].y_hat
